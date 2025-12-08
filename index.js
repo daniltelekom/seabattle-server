@@ -157,48 +157,202 @@ io.on('connection', socket => {
   });
 
   // shoot
-  socket.on('shoot', ({matchId, playerId, x, y})=>{
+ // ---------- REPLACE current 'shoot' handler with this safer version ----------
+/*
+  Expected client usage:
+    socket.timeout(5000).emit('shoot', { matchId, playerId, x, y }, (err, ack) => {
+      // err = timeout error (if no ack)
+      // ack = server response object { ok: true/false, error?, result?, sunkShip?, newTurn?, finished?, winner? }
+    });
+*/
+socket.on('shoot', async (data, ackFn) => {
+  try {
+    const matchId = data.matchId;
+    const playerId = String(data.playerId);
+    const x = Number(data.x);
+    const y = Number(data.y);
+
     const m = matches[matchId];
-    if(!m) return socket.emit('error',{error:'no_match'});
-    if(m.state!=='started') return socket.emit('error',{error:'not_started'});
-    if(String(m.turn) !== String(playerId)) return socket.emit('error',{error:'not_your_turn'});
-    const ev = evaluateShot(m, String(playerId), Number(x), Number(y));
-    if(ev.error) return socket.emit('error', ev);
-    // broadcast shot result to room
-    io.to(matchId).emit('shot_result', { matchId, shooter: playerId, x, y, result: ev.result, sunkShipId: ev.sunkShipId, finished: ev.finished, winner: ev.winner, newTurn: ev.newTurn });
-    // if match finished, send match result
-    if(ev.finished){
-      io.to(matchId).emit('match_finished', { matchId, winner: ev.winner, result: m.result });
+    if(!m){
+      // prefer calling ack if available
+      if(typeof ackFn === 'function') return ackFn(null, { ok:false, error:'no_match' });
+      return socket.emit('error', { error:'no_match' });
     }
-  });
 
-  // player leaves / disconnect
-  socket.on('leave', ({playerId, matchId})=>{
-    if(playerId) {
-      const idx = queue.indexOf(String(playerId));
-      if(idx !== -1) queue.splice(idx,1);
+    // serialize shots per-match to avoid race conditions
+    if(m._lock){
+      // another shoot currently processed
+      if(typeof ackFn === 'function') return ackFn(null, { ok:false, error:'busy' });
+      return socket.emit('error', { error:'busy' });
     }
-    if(matchId){
-      const m = matches[matchId];
-      if(m){
-        m.players = m.players.filter(p=>p!==String(playerId));
-        io.to(matchId).emit('player_left', { playerId, matchId });
-        if(m.players.length===0) delete matches[matchId];
+    m._lock = true;
+
+    try {
+      if(m.state !== 'started'){
+        if(typeof ackFn === 'function') return ackFn(null, { ok:false, error:'not_started' });
+        return socket.emit('error', { error:'not_started' });
       }
-    }
-    if(playerId) delete sockets[String(playerId)];
-  });
+      if(String(m.turn) !== String(playerId)){
+        if(typeof ackFn === 'function') return ackFn(null, { ok:false, error:'not_your_turn' });
+        return socket.emit('error', { error:'not_your_turn' });
+      }
 
-  socket.on('disconnect', ()=> {
-    const pid = socket.data.playerId;
-    if(pid) {
-      delete sockets[pid];
-      const idx = queue.indexOf(pid);
-      if(idx!==-1) queue.splice(idx,1);
+      const idx = coordToIdx(x,y);
+      // detect already shot (anyone) at this idx
+      const already = m.moves.find(ms => ms.idx === idx);
+      if(already){
+        if(typeof ackFn === 'function') return ackFn(null, { ok:false, error:'already_shot', existing: already });
+        return socket.emit('error', { error:'already_shot', existing: already });
+      }
+
+      // Evaluate shot (reuse evaluateShot)
+      const ev = evaluateShot(m, playerId, x, y);
+      if(ev.error){
+        if(typeof ackFn === 'function') return ackFn(null, { ok:false, error: ev.error });
+        return socket.emit('error', ev);
+      }
+
+      // Build detailed sunkShip info (if any)
+      let sunkShip = null;
+      if(ev.sunkShipId){
+        const oppId = m.players.find(p => p !== playerId);
+        const oppShips = m.placements[oppId] || [];
+        const ship = oppShips.find(s => String(s.id) === String(ev.sunkShipId) || s.id === ev.sunkShipId);
+        if(ship){
+          sunkShip = {
+            id: ship.id,
+            size: ship.size || (ship.cells ? ship.cells.length : null),
+            cells: ship.cells,
+            orientation: ship.orientation || 'H',
+            owner: oppId,
+            skinId: ship.skinId || null
+          };
+        }
+      }
+
+      const ackPayload = {
+        ok: true,
+        result: ev.result, // 'miss'|'hit'|'sunk'
+        x, y,
+        idx,
+        newTurn: ev.newTurn,
+        finished: !!ev.finished,
+        winner: ev.winner || null,
+        sunkShip: sunkShip
+      };
+
+      // Send immediate ack to the shooter (so client doesn't hang)
+      if(typeof ackFn === 'function') ackFn(null, ackPayload);
+
+      // Broadcast shot result to both players / spectators in the match room
+      io.to(matchId).emit('shot_result', {
+        matchId,
+        shooter: playerId,
+        x, y, idx,
+        result: ev.result,
+        sunkShip,
+        finished: !!ev.finished,
+        winner: ev.winner || null,
+        newTurn: ev.newTurn
+      });
+
+      // if finished, also broadcast match_finished (you already do)
+      if(ev.finished){
+        io.to(matchId).emit('match_finished', { matchId, winner: ev.winner, result: m.result || null });
+      }
+
+    } finally {
+      // release lock
+      m._lock = false;
     }
-    console.log('socket disconnect', socket.id);
-  });
+  } catch(err){
+    console.error('shoot handler error', err);
+    if(typeof ackFn === 'function') return ackFn(null, { ok:false, error:'server_error' });
+    socket.emit('error', { error:'server_error' });
+  }
 });
 
+  // player leaves / disconnect
+// Improved leave + disconnect handlers
+socket.on('leave', ({ playerId, matchId } = {}) => {
+  try {
+    // remove from search queue if present
+    if (playerId) {
+      const sId = String(playerId);
+      const qidx = queue.indexOf(sId);
+      if (qidx !== -1) queue.splice(qidx, 1);
+    }
+
+    // if leaving a match, update match state and notify others
+    if (matchId) {
+      const m = matches[matchId];
+      if (m) {
+        // remove player from match players list
+        m.players = m.players.filter(p => p !== String(playerId));
+        io.to(matchId).emit('player_left', { playerId: String(playerId), matchId });
+
+        // if someone still remains — mark match aborted and notify
+        if (m.players.length === 1) {
+          m.state = 'aborted';
+          const remaining = m.players[0];
+          io.to(matchId).emit('match_aborted', { matchId, reason: 'opponent_left', remainingPlayer: remaining });
+          // optionally keep minimal record, then delete to free memory
+          delete matches[matchId];
+        } else if (m.players.length === 0) {
+          // nobody left — free the match
+          delete matches[matchId];
+        }
+      }
+    }
+
+    // finally remove socket mapping
+    if (playerId) {
+      delete sockets[String(playerId)];
+      // also try to remove from any queue occurrences
+      const sId = String(playerId);
+      let qi = queue.indexOf(sId);
+      while (qi !== -1) {
+        queue.splice(qi, 1);
+        qi = queue.indexOf(sId);
+      }
+    }
+  } catch (err) {
+    console.error('leave handler error', err);
+  }
+});
+
+socket.on('disconnect', () => {
+  try {
+    const pid = socket.data && socket.data.playerId;
+    if (pid) {
+      const sId = String(pid);
+      // remove from sockets map
+      if (sockets[sId]) delete sockets[sId];
+      // remove from queue
+      const idx = queue.indexOf(sId);
+      if (idx !== -1) queue.splice(idx, 1);
+
+      // find any matches where this player is present and handle it similar to leave
+      Object.keys(matches).forEach(matchId => {
+        const m = matches[matchId];
+        if (m && m.players.includes(sId)) {
+          m.players = m.players.filter(p => p !== sId);
+          io.to(matchId).emit('player_left', { playerId: sId, matchId });
+          if (m.players.length === 1) {
+            m.state = 'aborted';
+            const remaining = m.players[0];
+            io.to(matchId).emit('match_aborted', { matchId, reason: 'opponent_disconnected', remainingPlayer: remaining });
+            delete matches[matchId];
+          } else if (m.players.length === 0) {
+            delete matches[matchId];
+          }
+        }
+      });
+    }
+    console.log('socket disconnected', socket.id, 'player', socket.data && socket.data.playerId);
+  } catch (err) {
+    console.error('disconnect handler error', err);
+  }
+});
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, ()=> console.log('SeaStrike socket server listening on', PORT));
