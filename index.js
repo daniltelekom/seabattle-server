@@ -94,33 +94,51 @@ io.on('connection', socket => {
     io.to(matchId).emit('match_joined', { matchId });
   });
 
-  // find_match (simple FIFO)
-  socket.on('find_match', (data) => {
-    const playerId = normalizeId(data.playerId);
-    // don't add duplicate
-    if(!searchQueue.includes(playerId)) searchQueue.push(playerId);
-    if(searchQueue.length >= 2){
-      const a = searchQueue.shift();
-      const b = searchQueue.shift();
-      const mid = genId('m');
-      const match = {
-        id: mid,
-        players: [a,b],
-        placements: {},
-        shots: {},
-        turn: a,
-        state: 'waiting'
-      };
-      matches.set(mid, match);
-      // notify both if they connected via sockets
-      const sidA = sockets.get(a);
-      const sidB = sockets.get(b);
-      if(sidA) io.to(sidA).emit('match_found', { matchId: mid, players: match.players, turn: match.turn });
-      if(sidB) io.to(sidB).emit('match_found', { matchId: mid, players: match.players, turn: match.turn });
-    } else {
-      socket.emit('find_ack', { status: 'queued' });
-    }
-  });
+ // find_match (FIFO, учитываем конкретные сокеты)
+socket.on('find_match', (data) => {
+  const playerId = normalizeId(data.playerId);
+
+  // добавляем в очередь объект { playerId, socketId }
+  const already = searchQueue.find(q => q.playerId === playerId);
+  if (!already) {
+    searchQueue.push({ playerId, socketId: socket.id });
+  }
+
+  // если есть хотя бы двое в очереди — создаём матч
+  if (searchQueue.length >= 2) {
+    const a = searchQueue.shift();
+    const b = searchQueue.shift();
+
+    const mid = genId('m');
+    const match = {
+      id: mid,
+      players: [a.playerId, b.playerId],
+      placements: {},
+      shots: {},
+      turn: a.playerId,   // первый в очереди ходит первым
+      state: 'waiting'
+    };
+    matches.set(mid, match);
+
+    // оба сокета в комнату матча
+    if (a.socketId) io.sockets.sockets.get(a.socketId)?.join(mid);
+    if (b.socketId) io.sockets.sockets.get(b.socketId)?.join(mid);
+
+    // слать match_found прямо в конкретные сокеты
+    if (a.socketId) io.to(a.socketId).emit('match_found', {
+      matchId: mid,
+      players: match.players,
+      turn: match.turn
+    });
+    if (b.socketId) io.to(b.socketId).emit('match_found', {
+      matchId: mid,
+      players: match.players,
+      turn: match.turn
+    });
+  } else {
+    socket.emit('find_ack', { status: 'queued' });
+  }
+});
 
   // place_ships
   socket.on('place_ships', (data) => {
