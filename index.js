@@ -36,6 +36,7 @@ const PORT = process.env.PORT || 3000;
 */
 const matches = new Map();
 const sockets = new Map();
+/** очередь поиска: [{ playerId, socketId }] */
 const searchQueue = [];
 
 /* helpers */
@@ -43,6 +44,11 @@ function cellIndex(x,y){ return y*10 + x; }
 function genId(prefix='m'){ return prefix + Math.random().toString(36).slice(2,9); }
 function normalizeId(id){ return String(id); }
 function otherPlayer(match, playerId){ return match.players.find(p => String(p) !== String(playerId)); }
+function removeFromQueue(playerId){
+  const pid = normalizeId(playerId);
+  const idx = searchQueue.findIndex(q => String(q.playerId) === pid);
+  if(idx !== -1) searchQueue.splice(idx,1);
+}
 
 /* health */
 app.get('/health', (req,res)=> res.json({ ok:true, service:'SeaStrike Socket Server' }) );
@@ -59,7 +65,7 @@ io.on('connection', socket => {
     } catch(e){ console.error(e); }
   });
 
-  // create_match
+  // create_match (игра с другом)
   socket.on('create_match', data => {
     const playerId = normalizeId(data.playerId);
     const mId = genId('m');
@@ -79,7 +85,7 @@ io.on('connection', socket => {
     socket.emit('match_created', { matchId: mId });
   });
 
-  // join_match
+  // join_match (по ID)
   socket.on('join_match', data => {
     const playerId = normalizeId(data.playerId);
     const matchId = data.matchId;
@@ -90,7 +96,7 @@ io.on('connection', socket => {
     }
     if(match.players.includes(playerId)){
       socket.join(matchId);
-      socket.emit('match_joined', { matchId });
+      socket.emit('match_joined', { matchId, players: match.players });
       return;
     }
     if(match.players.length >= 2){
@@ -102,32 +108,43 @@ io.on('connection', socket => {
     io.to(matchId).emit('match_joined', { matchId, players: match.players });
   });
 
-  // find_match (quick play)
+  // find_match (быстрый поиск)
   socket.on('find_match', data => {
     const playerId = normalizeId(data.playerId);
-    if(!searchQueue.includes(playerId)) searchQueue.push(playerId);
+    const socketId = socket.id;
+
+    // не дублируем игрока в очереди
+    if(!searchQueue.find(q => q.playerId === playerId)){
+      searchQueue.push({ playerId, socketId });
+    }
 
     if(searchQueue.length >= 2){
-      const a = searchQueue.shift();
+      const a = searchQueue.shift(); // {playerId, socketId}
       const b = searchQueue.shift();
+
       const mId = genId('m');
       const match = {
         id: mId,
-        players: [a,b],
+        players: [a.playerId, b.playerId],
         placements: {},
         shots: {},
         hits: {},
         sunk: {},
-        turn: a,
+        turn: a.playerId,      // первый в очереди ходит первым
         state: 'waiting',
         rematch: new Set()
       };
       matches.set(mId, match);
 
-      const sidA = sockets.get(a);
-      const sidB = sockets.get(b);
-      if(sidA) io.to(sidA).emit('match_found', { matchId: mId, players: match.players, turn: match.turn });
-      if(sidB) io.to(sidB).emit('match_found', { matchId: mId, players: match.players, turn: match.turn });
+      // заводим оба сокета в комнату матча
+      const sA = io.sockets.sockets.get(a.socketId);
+      const sB = io.sockets.sockets.get(b.socketId);
+      if(sA) sA.join(mId);
+      if(sB) sB.join(mId);
+
+      // шлём обоим match_found
+      if(sA) sA.emit('match_found', { matchId: mId, players: match.players, turn: match.turn });
+      if(sB) sB.emit('match_found', { matchId: mId, players: match.players, turn: match.turn });
     } else {
       socket.emit('find_ack', { status:'queued' });
     }
@@ -137,24 +154,24 @@ io.on('connection', socket => {
   socket.on('place_ships', data => {
     const playerId = normalizeId(data.playerId);
     const matchId = data.matchId;
-    const ships = data.ships || [];
-    const match = matches.get(matchId);
+    const ships   = data.ships || [];
+    const match   = matches.get(matchId);
     if(!match){ socket.emit('error',{error:'match_not_found'}); return; }
 
     match.placements[playerId] = ships;
     match.shots[playerId] = match.shots[playerId] || new Set();
-    match.hits[playerId] = match.hits[playerId] || new Set();
+    match.hits[playerId]  = match.hits[playerId]  || new Set();
 
     io.to(matchId).emit('placement_update', { playerId });
 
     if(Object.keys(match.placements).length === 2 && match.state !== 'started'){
       match.state = 'started';
-      match.turn = match.players[0];
+      match.turn  = match.players[0];
       io.to(matchId).emit('match_started', { matchId, turn: match.turn });
     }
   });
 
-  // equip_skin (пока только ACK)
+  // equip_skin (пока просто ACK)
   socket.on('equip_skin', data => {
     socket.emit('profile', { equippedSkin: data.skinId, ownedSkins: [] });
   });
@@ -169,7 +186,7 @@ io.on('connection', socket => {
   socket.on('shoot', (data, ackFn) => {
     try{
       const playerId = normalizeId(data.playerId);
-      const matchId = data.matchId;
+      const matchId  = data.matchId;
       const x = Number(data.x);
       const y = Number(data.y);
       const match = matches.get(matchId);
@@ -177,12 +194,10 @@ io.on('connection', socket => {
         ackFn && ackFn(null,{ok:false,error:'match_not_found'});
         return;
       }
-
       if(match.state !== 'started'){
         ackFn && ackFn(null,{ok:false,error:'match_not_started'});
         return;
       }
-
       if(String(match.turn) !== String(playerId)){
         ackFn && ackFn(null,{ok:false,error:'not_your_turn'});
         return;
@@ -190,7 +205,6 @@ io.on('connection', socket => {
 
       const idx = cellIndex(x,y);
       match.shots[playerId] = match.shots[playerId] || new Set();
-
       if(match.shots[playerId].has(idx)){
         ackFn && ackFn(null,{ok:false,error:'already_shot',existing:{player:playerId,x,y,idx}});
         return;
@@ -204,9 +218,7 @@ io.on('connection', socket => {
       }
 
       const oppShips = match.placements[oppId] || [];
-      let hit = false;
-      let sunk = false;
-      let sunkShip = null;
+      let hit = false, sunk = false, sunkShip = null;
 
       for(const ship of oppShips){
         const cells = ship.cells || [];
@@ -215,7 +227,7 @@ io.on('connection', socket => {
           match.hits[oppId] = match.hits[oppId] || new Set();
           match.hits[oppId].add(idx);
 
-          let allHit = cells.every(c => match.hits[oppId].has(c));
+          const allHit = cells.every(c => match.hits[oppId].has(c));
           if(allHit){
             sunk = true;
             sunkShip = {
@@ -231,19 +243,18 @@ io.on('connection', socket => {
       }
 
       const result = sunk ? 'sunk' : (hit ? 'hit' : 'miss');
-
       let finished = false;
-      let winner = null;
+      let winner   = null;
 
       if(sunk && sunkShip){
         match.sunk[oppId] = match.sunk[oppId] || [];
         match.sunk[oppId].push(sunkShip);
 
-        const totalParts = oppShips.reduce((sum, sh) => sum + (sh.cells ? sh.cells.length : (sh.size||0)), 0);
-        const hitCount = (match.hits[oppId] && match.hits[oppId].size) || 0;
-        if(hitCount >= totalParts && totalParts > 0){
+        const totalParts = oppShips.reduce((s,sh)=> s + (sh.cells ? sh.cells.length : (sh.size||0)), 0);
+        const hitCount   = (match.hits[oppId] && match.hits[oppId].size) || 0;
+        if(totalParts > 0 && hitCount >= totalParts){
           finished = true;
-          winner = playerId;
+          winner   = playerId;
           match.state = 'finished';
         }
       }
@@ -279,8 +290,8 @@ io.on('connection', socket => {
   // request_rematch
   socket.on('request_rematch', data => {
     const playerId = normalizeId(data.playerId);
-    const matchId = data.matchId;
-    const match = matches.get(matchId);
+    const matchId  = data.matchId;
+    const match    = matches.get(matchId);
     if(!match || match.state !== 'finished'){
       socket.emit('error',{error:'rematch_not_available'});
       return;
@@ -292,19 +303,15 @@ io.on('connection', socket => {
     io.to(matchId).emit('rematch_vote', { matchId, playerId });
 
     if(match.rematch.size >= match.players.length){
-      // оба согласились
-      match.state = 'waiting';
+      match.state      = 'waiting';
       match.placements = {};
-      match.shots = {};
-      match.hits = {};
-      match.sunk = {};
-      match.rematch = new Set();
-      match.turn = match.players[0];
+      match.shots      = {};
+      match.hits       = {};
+      match.sunk       = {};
+      match.rematch    = new Set();
+      match.turn       = match.players[0];
 
-      io.to(matchId).emit('rematch_start', {
-        matchId,
-        turn: match.turn
-      });
+      io.to(matchId).emit('rematch_start', { matchId, turn: match.turn });
     } else {
       socket.emit('rematch_pending', { matchId });
     }
@@ -313,11 +320,14 @@ io.on('connection', socket => {
   // leave
   socket.on('leave', data => {
     const playerId = normalizeId(data.playerId);
-    const matchId = data.matchId;
-    const match = matches.get(matchId);
+    const matchId  = data.matchId;
+    const match    = matches.get(matchId);
+
+    removeFromQueue(playerId);
+
     if(match){
       match.state = 'aborted';
-      io.to(matchId).emit('player_left',{playerId});
+      io.to(matchId).emit('player_left', { playerId });
       matches.delete(matchId);
     }
     sockets.delete(playerId);
@@ -325,7 +335,10 @@ io.on('connection', socket => {
   });
 
   socket.on('disconnect', () => {
-    if(socket.playerId) sockets.delete(socket.playerId);
+    if(socket.playerId){
+      removeFromQueue(socket.playerId);
+      sockets.delete(socket.playerId);
+    }
   });
 });
 
