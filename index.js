@@ -182,110 +182,133 @@ io.on('connection', socket => {
     socket.emit('purchase_result', { ok:true, skinId, ownedSkins:[skinId] });
   });
 
-  // shoot
-  socket.on('shoot', (data, ackFn) => {
-    try{
-      const playerId = normalizeId(data.playerId);
-      const matchId  = data.matchId;
-      const x = Number(data.x);
-      const y = Number(data.y);
-      const match = matches.get(matchId);
-      if(!match){
-        ackFn && ackFn(null,{ok:false,error:'match_not_found'});
-        return;
-      }
-      if(match.state !== 'started'){
-        ackFn && ackFn(null,{ok:false,error:'match_not_started'});
-        return;
-      }
-      if(String(match.turn) !== String(playerId)){
-        ackFn && ackFn(null,{ok:false,error:'not_your_turn'});
-        return;
-      }
-
-      const idx = cellIndex(x,y);
-      match.shots[playerId] = match.shots[playerId] || new Set();
-      if(match.shots[playerId].has(idx)){
-        ackFn && ackFn(null,{ok:false,error:'already_shot',existing:{player:playerId,x,y,idx}});
-        return;
-      }
-      match.shots[playerId].add(idx);
-
-      const oppId = otherPlayer(match, playerId);
-      if(!oppId){
-        ackFn && ackFn(null,{ok:false,error:'no_opponent'});
-        return;
-      }
-
-      const oppShips = match.placements[oppId] || [];
-      let hit = false, sunk = false, sunkShip = null;
-
-      for(const ship of oppShips){
-        const cells = ship.cells || [];
-        if(cells.includes(idx)){
-          hit = true;
-          match.hits[oppId] = match.hits[oppId] || new Set();
-          match.hits[oppId].add(idx);
-
-          const allHit = cells.every(c => match.hits[oppId].has(c));
-          if(allHit){
-            sunk = true;
-            sunkShip = {
-              cells,
-              size: ship.size,
-              orientation: ship.orientation,
-              skinId: ship.skinId || null,
-              owner: oppId
-            };
-          }
-          break;
-        }
-      }
-
-      const result = sunk ? 'sunk' : (hit ? 'hit' : 'miss');
-      let finished = false;
-      let winner   = null;
-
-      if(sunk && sunkShip){
-        match.sunk[oppId] = match.sunk[oppId] || [];
-        match.sunk[oppId].push(sunkShip);
-
-        const totalParts = oppShips.reduce((s,sh)=> s + (sh.cells ? sh.cells.length : (sh.size||0)), 0);
-        const hitCount   = (match.hits[oppId] && match.hits[oppId].size) || 0;
-        if(totalParts > 0 && hitCount >= totalParts){
-          finished = true;
-          winner   = playerId;
-          match.state = 'finished';
-        }
-      }
-
-      if(!finished){
-        match.turn = oppId;
-      }
-
-      const payload = {
-        matchId,
-        shooter: playerId,
-        x, y,
-        result,
-        newTurn: finished ? null : match.turn,
-        finished,
-        winner,
-        sunkShip
-      };
-
-      ackFn && ackFn(null,{ ok:true, ...payload });
-      io.to(matchId).emit('shot_result', payload);
-
-      if(finished){
-        io.to(matchId).emit('match_finished', { matchId, winner });
-      }
-
-    } catch(e){
-      console.error('shoot error', e);
-      ackFn && ackFn(null,{ok:false,error:'server_error'});
+// shoot — правила: попал/потопил = ходишь ещё, промах = ход переходит
+socket.on('shoot', (data, ackFn) => {
+  try{
+    const playerId = normalizeId(data.playerId);
+    const matchId  = data.matchId;
+    const x = Number(data.x);
+    const y = Number(data.y);
+    const match = matches.get(matchId);
+    if(!match){
+      ackFn && ackFn(null,{ok:false,error:'match_not_found'});
+      return;
     }
-  });
+    if(match.state !== 'started'){
+      ackFn && ackFn(null,{ok:false,error:'match_not_started'});
+      return;
+    }
+    if(String(match.turn) !== String(playerId)){
+      ackFn && ackFn(null,{ok:false,error:'not_your_turn'});
+      return;
+    }
+
+    const idx = cellIndex(x,y);
+    match.shots[playerId] = match.shots[playerId] || new Set();
+
+    // уже стреляли в эту клетку этим игроком
+    if(match.shots[playerId].has(idx)){
+      ackFn && ackFn(null,{
+        ok:false,
+        error:'already_shot',
+        existing:{ player:playerId, x, y, idx }
+      });
+      return;
+    }
+    match.shots[playerId].add(idx);
+
+    const oppId = otherPlayer(match, playerId);
+    if(!oppId){
+      ackFn && ackFn(null,{ok:false,error:'no_opponent'});
+      return;
+    }
+
+    const oppShips = match.placements[oppId] || [];
+    let hit = false, sunk = false, sunkShip = null;
+
+    for(const ship of oppShips){
+      const cells = ship.cells || [];
+      if(cells.includes(idx)){
+        hit = true;
+        match.hits[oppId] = match.hits[oppId] || new Set();
+        match.hits[oppId].add(idx);
+
+        const allHit = cells.every(c => match.hits[oppId].has(c));
+        if(allHit){
+          sunk = true;
+          sunkShip = {
+            cells,
+            size: ship.size,
+            orientation: ship.orientation,
+            skinId: ship.skinId || null,
+            owner: oppId
+          };
+        }
+        break;
+      }
+    }
+
+    const result = sunk ? 'sunk' : (hit ? 'hit' : 'miss');
+    let finished = false;
+    let winner   = null;
+
+    if(sunk && sunkShip){
+      match.sunk[oppId] = match.sunk[oppId] || [];
+      match.sunk[oppId].push(sunkShip);
+
+      const totalParts = oppShips.reduce(
+        (s,sh)=> s + (sh.cells ? sh.cells.length : (sh.size||0)),
+        0
+      );
+      const hitCount   = (match.hits[oppId] && match.hits[oppId].size) || 0;
+
+      if(totalParts > 0 && hitCount >= totalParts){
+        finished   = true;
+        winner     = playerId;
+        match.state = 'finished';
+      }
+    }
+
+    // >>> вот тут логика “попал — ходишь ещё”
+    if(!finished){
+      if(result === 'miss') {
+        // промах — ход переходит сопернику
+        match.turn = oppId;
+      } else {
+        // hit или sunk — стреляет тот же игрок ещё раз
+        match.turn = playerId;
+      }
+    } else {
+      // матч закончился — хода больше нет
+      match.turn = null;
+    }
+
+    const payload = {
+      matchId,
+      shooter: playerId,
+      x, y,
+      result,
+      newTurn: finished ? null : match.turn,
+      finished,
+      winner,
+      sunkShip
+    };
+
+    // ACK стрелявшему
+    ackFn && ackFn(null,{ ok:true, ...payload });
+
+    // всем в комнате
+    io.to(matchId).emit('shot_result', payload);
+
+    if(finished){
+      io.to(matchId).emit('match_finished', { matchId, winner });
+    }
+
+  } catch(e){
+    console.error('shoot error', e);
+    ackFn && ackFn(null,{ok:false,error:'server_error'});
+  }
+});
 
   // request_rematch
   socket.on('request_rematch', data => {
