@@ -310,35 +310,50 @@ socket.on('shoot', (data, ackFn) => {
   }
 });
 
-  // request_rematch
-  socket.on('request_rematch', data => {
+ // запрос на реванш
+socket.on('request_rematch', (data) => {
+  try {
     const playerId = normalizeId(data.playerId);
     const matchId  = data.matchId;
     const match    = matches.get(matchId);
-    if(!match || match.state !== 'finished'){
-      socket.emit('error',{error:'rematch_not_available'});
+
+    if (!match) {
+      socket.emit('error', { error: 'match_not_found' });
       return;
     }
 
-    match.rematch = match.rematch || new Set();
-    match.rematch.add(playerId);
+    // заводим набор голосов за реванш
+    if (!match.rematchVotes) match.rematchVotes = new Set();
+    match.rematchVotes.add(playerId);
 
+    // всем в матче говорим, что игрок попросил реванш
     io.to(matchId).emit('rematch_vote', { matchId, playerId });
 
-    if(match.rematch.size >= match.players.length){
-      match.state      = 'waiting';
-      match.placements = {};
-      match.shots      = {};
-      match.hits       = {};
-      match.sunk       = {};
-      match.rematch    = new Set();
-      match.turn       = match.players[0];
-
-      io.to(matchId).emit('rematch_start', { matchId, turn: match.turn });
-    } else {
+    // если ещё не все согласились — просто ждём
+    if (match.rematchVotes.size < match.players.length) {
       socket.emit('rematch_pending', { matchId });
+      return;
     }
-  });
+
+    // оба (или все) нажали реванш — стартуем новый раунд в том же матче
+    match.state       = 'waiting';
+    match.placements  = {};
+    match.shots       = {};
+    match.hits        = {};
+    match.sunk        = {};
+    // случайно выбираем, кто ходит первым
+    const starterIdx  = Math.floor(Math.random() * match.players.length);
+    match.turn        = match.players[starterIdx];
+
+    io.to(matchId).emit('rematch_started', {
+      matchId,
+      turn: match.turn
+    });
+  } catch (e) {
+    console.error('request_rematch error', e);
+    socket.emit('error', { error: 'server_error' });
+  }
+});
 
   // leave
   socket.on('leave', data => {
