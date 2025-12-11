@@ -200,12 +200,20 @@ io.on('connection', (socket) => {
       socket.emit('error', { error: 'match_full' });
       return;
     }
-    match.players.push(playerId);
-    socket.join(matchId);
-    io.to(matchId).emit('match_joined', {
-      matchId,
-      players: match.players,
-    });
+   match.players.push(playerId);
+socket.join(matchId);
+
+// тоже готовим рейтинги всех игроков
+const ratingsPayload = {};
+match.players.forEach(pid => {
+  ratingsPayload[pid] = getRating(pid);
+});
+
+io.to(matchId).emit('match_joined', {
+  matchId,
+  players: match.players,
+  ratings: ratingsPayload,   // <-- добавили
+});
   });
 
   // find_match (быстрый поиск)
@@ -242,19 +250,25 @@ io.on('connection', (socket) => {
       if (sA) sA.join(mId);
       if (sB) sB.join(mId);
 
-      // шлём обоим match_found
-      if (sA)
-        sA.emit('match_found', {
-          matchId: mId,
-          players: match.players,
-          turn: match.turn,
-        });
-      if (sB)
-        sB.emit('match_found', {
-          matchId: mId,
-          players: match.players,
-          turn: match.turn,
-        });
+     // сформируем таблицу рейтингов всех игроков матча
+const ratingsPayload = {};
+match.players.forEach(pid => {
+  ratingsPayload[pid] = getRating(pid);
+});
+
+if (sA) sA.emit('match_found', {
+  matchId: mId,
+  players: match.players,
+  turn: match.turn,
+  ratings: ratingsPayload,   // <-- добавили
+});
+
+if (sB) sB.emit('match_found', {
+  matchId: mId,
+  players: match.players,
+  turn: match.turn,
+  ratings: ratingsPayload,   // <-- добавили
+});
     } else {
       socket.emit('find_ack', { status: 'queued' });
     }
